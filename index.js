@@ -1,173 +1,166 @@
-// src/index.js  (Railway-ready)
+// src/index.js  (Railway Production Ready)
 // Main Entry Point — Business Verification Telegram Bot
 
+// Load env FIRST before anything else
 require('dotenv').config();
 
 // Pastikan direktori persisten ada sebelum apapun diload
 const { ensurePersistentDirs } = require('./utils/storage');
 ensurePersistentDirs();
-const express = require('express');
-const cron = require('node-cron');
-const logger = require('./utils/logger');
+
+const express  = require('express');
+const cron     = require('node-cron');
+const logger   = require('./utils/logger');
 const { initializeDatabase } = require('./database/schema');
-const { AdminDB } = require('./database/queries');
-const { createBot } = require('./bot/index');
+const { AdminDB }             = require('./database/queries');
+const { createBot }           = require('./bot/index');
 const { createWebhookRouter } = require('./payment/webhook');
 const { autoCheckExpiredOrders } = require('./services/verification');
 
-// =============================================
-// ASCII BANNER
-// =============================================
-const banner = `
-╔══════════════════════════════════════════════╗
-║   Business Verification Telegram Bot v1.0   ║
-║   Production Ready | NodeJS + SQLite        ║
-╚══════════════════════════════════════════════╝
-`;
+// Banner (plain, no ANSI — Railway strips colors in some log views)
+console.log('==============================================');
+console.log('  Business Verification Telegram Bot v1.0   ');
+console.log('  NodeJS | SQLite | Railway Ready            ');
+console.log('==============================================');
+console.log(`  NODE_ENV : ${process.env.NODE_ENV || 'development'}`);
+console.log(`  PORT     : ${process.env.PORT || process.env.BOT_PORT || 3000}`);
+console.log(`  DB PATH  : ${process.env.DATABASE_PATH || './data/bot.db'}`);
+console.log('==============================================');
 
-console.log('\x1b[35m' + banner + '\x1b[0m');
-
-// =============================================
-// INITIALIZE DATABASE
-// =============================================
-logger.info('Starting bot...');
-initializeDatabase();
-
-// Setup Super Admin in database
-const superAdminId = process.env.SUPER_ADMIN_ID;
-if (superAdminId && !AdminDB.findById(superAdminId)) {
-  AdminDB.add(superAdminId, process.env.SUPER_ADMIN_USERNAME, 'Super Admin', 'super_admin', 'system');
-  logger.info(`Super Admin configured: ${superAdminId}`);
+// ─────────────────────────────────────────────
+// Validate required env vars
+// ─────────────────────────────────────────────
+const REQUIRED_VARS = ['BOT_TOKEN', 'SUPER_ADMIN_ID'];
+const missing = REQUIRED_VARS.filter(v => !process.env[v]);
+if (missing.length > 0) {
+  console.error(`\n❌ FATAL: Missing required environment variables: ${missing.join(', ')}`);
+  console.error('   Set them in Railway → Service → Variables\n');
+  process.exit(1);
 }
 
-// =============================================
-// CREATE BOT
-// =============================================
-const bot = createBot();
+// ─────────────────────────────────────────────
+// Database
+// ─────────────────────────────────────────────
+initializeDatabase();
+logger.info('Database ready');
 
-// =============================================
-// EXPRESS SERVER FOR WEBHOOKS
-// =============================================
+const superAdminId = process.env.SUPER_ADMIN_ID;
+if (superAdminId && !AdminDB.findById(superAdminId)) {
+  AdminDB.add(superAdminId, process.env.SUPER_ADMIN_USERNAME || '', 'Super Admin', 'super_admin', 'system');
+  logger.info(`Super Admin registered: ${superAdminId}`);
+}
+
+// ─────────────────────────────────────────────
+// Bot + Express
+// ─────────────────────────────────────────────
+const bot = createBot();
 const app = express();
-// Railway inject PORT otomatis
+
+// Railway inject PORT otomatis — WAJIB gunakan process.env.PORT
 const PORT = parseInt(process.env.PORT || process.env.BOT_PORT || 3000);
 
-// Webhook routes
-const webhookRouter = createWebhookRouter(bot);
-app.use('/webhook', webhookRouter);
+app.use('/webhook', createWebhookRouter(bot));
 
-// Health check
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    bot: bot.botInfo?.username || 'connecting...',
-    timestamp: new Date().toISOString(),
-    uptime: Math.floor(process.uptime())
-  });
-});
+app.get('/health', (_req, res) => res.json({
+  status   : 'ok',
+  env      : process.env.NODE_ENV || 'development',
+  railway  : !!process.env.RAILWAY_ENVIRONMENT,
+  uptime   : Math.floor(process.uptime()),
+  timestamp: new Date().toISOString()
+}));
 
-// =============================================
-// CRON JOBS
-// =============================================
+app.use((_req, res) => res.status(404).json({ error: 'Not found' }));
 
-// Check expired orders every minute
-cron.schedule('* * * * *', async () => {
-  await autoCheckExpiredOrders(bot);
-});
-
-// Daily statistics at midnight
+// ─────────────────────────────────────────────
+// Cron Jobs
+// ─────────────────────────────────────────────
+cron.schedule('* * * * *', () => autoCheckExpiredOrders(bot));
 cron.schedule('0 0 * * *', () => {
-  logger.info('Running daily statistics update...');
   const { StatsDB } = require('./database/queries');
-  const stats = StatsDB.getSummary();
-  logger.info(`Daily stats: ${JSON.stringify(stats)}`);
+  logger.info(`[Cron] Daily stats: ${JSON.stringify(StatsDB.getSummary())}`);
 });
 
-// =============================================
-// START BOT
-// =============================================
+// ─────────────────────────────────────────────
+// Start
+// ─────────────────────────────────────────────
 const startBot = async () => {
   try {
-    const useWebhook = process.env.NODE_ENV === 'production' && process.env.WEBHOOK_DOMAIN;
+    const domain     = (process.env.WEBHOOK_DOMAIN || '').trim().replace(/\/$/, '');
+    const useWebhook = process.env.NODE_ENV === 'production' && domain;
 
     if (useWebhook) {
-      // Production: Use Webhook
-      const webhookPath = `/bot${process.env.BOT_TOKEN}`;
-      const webhookUrl = `${process.env.WEBHOOK_DOMAIN}${webhookPath}`;
-      
-      // Set bot webhook handler
-      app.use(bot.webhookCallback(webhookPath));
-      
-      // Start express server
+      // ── WEBHOOK MODE (Railway production) ───────────────
+      const tokenSafe  = process.env.BOT_TOKEN.replace(':', '_');
+      const hookPath   = `/tgbot${tokenSafe}`;
+      const hookUrl    = `${domain}${hookPath}`;
+
+      // Register Telegraf webhook handler BEFORE listen
+      app.use(bot.webhookCallback(hookPath));
+
       app.listen(PORT, async () => {
-        logger.info(`Webhook server running on port ${PORT}`);
-        
-        // Register webhook with Telegram
-        await bot.telegram.setWebhook(webhookUrl);
-        logger.info(`Webhook set to: ${webhookUrl}`);
-        
-        const botInfo = await bot.telegram.getMe();
-        logger.info(`Bot @${botInfo.username} is running in WEBHOOK mode ✅`);
-        
-        // Notify super admin
-        if (superAdminId) {
-          try {
-            await bot.telegram.sendMessage(
-              superAdminId,
-              `🚀 *Bot Started!*\n\nMode: Webhook\nServer: ${process.env.WEBHOOK_DOMAIN}\n⏰ ${new Date().toLocaleString('id-ID')}`,
+        logger.info(`Server listening on :${PORT}`);
+
+        try {
+          await bot.telegram.setWebhook(hookUrl, { drop_pending_updates: true });
+          logger.info(`Webhook set → ${hookUrl}`);
+        } catch (e) {
+          logger.error(`Failed to set webhook: ${e.message}`);
+        }
+
+        try {
+          const info = await bot.telegram.getMe();
+          logger.info(`✅ @${info.username} running — WEBHOOK mode`);
+
+          if (superAdminId) {
+            await bot.telegram.sendMessage(superAdminId,
+              `🚀 *Bot Started (Railway)*\n\n` +
+              `Mode: Webhook\nDomain: \`${domain}\`\n` +
+              `⏰ ${new Date().toLocaleString('id-ID')}`,
               { parse_mode: 'Markdown' }
-            );
-          } catch (e) {}
+            ).catch(() => {});
+          }
+        } catch (e) {
+          logger.warn(`getMe failed: ${e.message}`);
         }
       });
+
     } else {
-      // Development: Use Long Polling
-      app.listen(PORT, () => {
-        logger.info(`HTTP server running on port ${PORT}`);
-      });
-      
+      // ── POLLING MODE (local dev) ─────────────────────────
+      try { await bot.telegram.deleteWebhook({ drop_pending_updates: true }); } catch (_) {}
+
+      app.listen(PORT, () => logger.info(`Server listening on :${PORT}`));
+
       await bot.launch();
-      
-      const botInfo = await bot.telegram.getMe();
-      logger.info(`Bot @${botInfo.username} is running in POLLING mode ✅`);
-      
-      // Notify super admin
+      const info = await bot.telegram.getMe();
+      logger.info(`✅ @${info.username} running — POLLING mode`);
+
       if (superAdminId) {
-        try {
-          await bot.telegram.sendMessage(
-            superAdminId,
-            `🚀 *Bot Started!*\n\nMode: Long Polling\n⏰ ${new Date().toLocaleString('id-ID')}`,
-            { parse_mode: 'Markdown' }
-          );
-        } catch (e) {}
+        await bot.telegram.sendMessage(superAdminId,
+          `🚀 *Bot Started (Dev)*\nMode: Polling\n⏰ ${new Date().toLocaleString('id-ID')}`,
+          { parse_mode: 'Markdown' }
+        ).catch(() => {});
       }
     }
   } catch (err) {
-    logger.error(`Failed to start bot: ${err.message}`);
+    logger.error(`Fatal startup error: ${err.message}\n${err.stack}`);
     process.exit(1);
   }
 };
 
+// ─────────────────────────────────────────────
 // Graceful shutdown
-process.once('SIGINT', () => {
-  logger.info('SIGINT received, shutting down...');
-  bot.stop('SIGINT');
+// ─────────────────────────────────────────────
+const shutdown = (sig) => {
+  logger.info(`${sig} — shutting down gracefully`);
+  bot.stop(sig);
   process.exit(0);
-});
+};
+process.once('SIGINT',  () => shutdown('SIGINT'));
+process.once('SIGTERM', () => shutdown('SIGTERM'));
 
-process.once('SIGTERM', () => {
-  logger.info('SIGTERM received, shutting down...');
-  bot.stop('SIGTERM');
-  process.exit(0);
-});
-
-// Unhandled errors
-process.on('unhandledRejection', (reason, promise) => {
-  logger.error(`Unhandled Rejection: ${reason}`);
-});
-
-process.on('uncaughtException', (err) => {
-  logger.error(`Uncaught Exception: ${err.message}`);
+process.on('unhandledRejection', (r) => logger.error(`UnhandledRejection: ${r}`));
+process.on('uncaughtException',  (e) => {
+  logger.error(`UncaughtException: ${e.message}\n${e.stack}`);
   process.exit(1);
 });
 

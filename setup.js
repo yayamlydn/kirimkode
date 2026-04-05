@@ -1,34 +1,52 @@
 // scripts/setup.js
-// One-time setup script
+// One-time setup script — safe to run during Railway build
 
-require('dotenv').config();
-const fs = require('fs');
+const fs   = require('fs');
 const path = require('path');
 
-console.log('\n🚀 Setting up Business Verification Bot...\n');
+console.log('\n🚀 Running setup...\n');
+
+// Resolve base dir (works both from /scripts and from root)
+const baseDir = path.resolve(__dirname, '..');
 
 // Create required directories
-const dirs = ['data', 'logs', 'public/css', 'public/js'];
+const dirs = [
+  path.join(baseDir, 'data'),
+  path.join(baseDir, 'logs'),
+  path.join(baseDir, 'public', 'css'),
+  path.join(baseDir, 'public', 'js')
+];
+
 dirs.forEach(dir => {
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
-    console.log(`✅ Created directory: ${dir}`);
+    console.log(`✅ Created: ${dir}`);
   }
 });
 
-// Copy .env.example to .env if not exists
-if (!fs.existsSync('.env') && fs.existsSync('.env.example')) {
-  fs.copyFileSync('.env.example', '.env');
+// Copy .env.example → .env only on local (not on Railway)
+const isRailway = !!process.env.RAILWAY_ENVIRONMENT;
+if (!isRailway && !fs.existsSync(path.join(baseDir, '.env')) && fs.existsSync(path.join(baseDir, '.env.example'))) {
+  fs.copyFileSync(
+    path.join(baseDir, '.env.example'),
+    path.join(baseDir, '.env')
+  );
   console.log('✅ Created .env from .env.example');
-  console.log('⚠️  Please edit .env with your actual values!\n');
+  console.log('⚠️  Edit .env with your actual values!\n');
 }
 
-// Initialize database
-const { initializeDatabase } = require('../src/database/schema');
-initializeDatabase();
-console.log('✅ Database initialized');
+// Try init DB only if env vars are available
+try {
+  // Load dotenv only on local
+  if (!isRailway) require('dotenv').config({ path: path.join(baseDir, '.env') });
+
+  if (process.env.DATABASE_PATH || !isRailway) {
+    const { initializeDatabase } = require('../src/database/schema');
+    initializeDatabase();
+    console.log('✅ Database initialized');
+  }
+} catch (e) {
+  console.log('ℹ️  DB init deferred to runtime:', e.message);
+}
 
 console.log('\n✅ Setup complete!\n');
-console.log('Next steps:');
-console.log('1. Edit .env with your BOT_TOKEN and other settings');
-console.log('2. Run: npm start\n');

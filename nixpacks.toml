@@ -1,17 +1,15 @@
 [phases.setup]
-nixPkgs = ["nodejs_20", "python3"]
+nixPkgs = ["nodejs_20"]
 
 [phases.install]
-cmds = ["npm install"]
+cmds = ["npm install --production"]
 
 [phases.build]
-cmds = [
-  "mkdir -p /app/data /app/logs",
-  "node scripts/setup.js"
-]
+cmds = ["node scripts/setup.js"]
 
 [start]
 cmd = "node src/index.js"
 
 [variables]
 NODE_ENV = "production"
+NPM_CONFIG_PRODUCTION = "false"
